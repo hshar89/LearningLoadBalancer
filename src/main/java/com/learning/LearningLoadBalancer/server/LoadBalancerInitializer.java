@@ -5,41 +5,32 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.util.ReferenceCountUtil;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class LoadBalancerInitializer extends ChannelInboundHandlerAdapter {
 
-    private final BackendConnectionPool backendConnectionPool;
+    private final UpstreamClientPool upstreamClientPool;
 
-    public LoadBalancerInitializer(BackendConnectionPool backendConnectionPool) {
-        this.backendConnectionPool = backendConnectionPool;
-    }
-
-    /**
-     * @param ctx
-     * @throws Exception
-     */
-    @Override
-    public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
-        super.channelRegistered(ctx);
+    public LoadBalancerInitializer(UpstreamClientPool upstreamClientPool) {
+        this.upstreamClientPool = upstreamClientPool;
     }
 
     @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+    public void channelRead(ChannelHandlerContext downstreamHandlerCtx, Object msg) {
         ByteBuf byteBuf = (ByteBuf) msg;
         byte[] array = new byte[byteBuf.readableBytes()];
         byteBuf.getBytes(byteBuf.readerIndex(), array);
-        log.info("Received request from downstream client: " + new String(array));
-        ChannelFuture channelFuture = backendConnectionPool.writeToBackendChannel(ctx, byteBuf);
+        log.info("Received request from downstream client: {}", new String(array));
+        ChannelFuture channelFuture =
+                upstreamClientPool.writeToUpstreamChannel(downstreamHandlerCtx, byteBuf);
         channelFuture.addListener(
                 (ChannelFutureListener)
                         future -> {
                             if (future.isSuccess()) {
-                                log.info("Successfully sent request to upstream client");
-                                ctx.channel().read();
+                                downstreamHandlerCtx.channel().read();
                             } else {
-                                log.info("Failed to send request to upstream client");
                                 String body = "Error when writing to upstream client";
                                 String httpResponse =
                                         "HTTP/1.1 503 Service Unavailable\r\n"
@@ -50,18 +41,21 @@ public class LoadBalancerInitializer extends ChannelInboundHandlerAdapter {
                                                 + "Connection: close\r\n"
                                                 + "\r\n"
                                                 + body;
-                                ctx.writeAndFlush(
-                                                ctx.alloc()
+                                downstreamHandlerCtx
+                                        .writeAndFlush(
+                                                downstreamHandlerCtx
+                                                        .alloc()
                                                         .buffer()
                                                         .writeBytes(httpResponse.getBytes()))
                                         .addListener(ChannelFutureListener.CLOSE);
+                                ReferenceCountUtil.release(byteBuf);
                             }
                         });
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        cause.printStackTrace();
+        log.error("Exception in Load Balancer channel", cause);
         ctx.close();
     }
 }

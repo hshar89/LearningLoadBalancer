@@ -3,33 +3,35 @@ package com.learning.LearningLoadBalancer.server;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import io.netty.util.AttributeKey;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
-    private final Queue<ChannelHandlerContext> pendingFrontendContexts =
-            new ConcurrentLinkedQueue<>();
 
-    public ClientResponseHandler() {}
-
-    public void enqueueFrontEndContext(ChannelHandlerContext frontEndContext) {
-        pendingFrontendContexts.offer(frontEndContext);
-    }
-
-    public void dequeFrontEndContext() {
-        pendingFrontendContexts.poll();
-    }
+    public static final AttributeKey<ChannelHandlerContext> DOWNSTREAM_CONTEXT_KEY =
+            AttributeKey.valueOf("downstreamContext");
+    public static final AttributeKey<ConnectionPool> CONNECTION_POOL_KEY =
+            AttributeKey.valueOf("connectionPool");
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        ChannelHandlerContext frontEndContext = pendingFrontendContexts.poll();
-        if (frontEndContext == null) {
-            log.error("No pending frontend context for response, discarding");
+        log.info(
+                "Channel read called on response handler {}, {}",
+                ctx.channel().id(),
+                ctx.channel().isActive());
+
+        ChannelHandlerContext downstreamContext = ctx.channel().attr(DOWNSTREAM_CONTEXT_KEY).get();
+        ConnectionPool connectionPool = ctx.channel().attr(CONNECTION_POOL_KEY).get();
+
+        if (downstreamContext == null || !downstreamContext.channel().isActive()) {
+            log.error("No pending downstream context for response, discarding");
+            if (connectionPool != null) {
+                connectionPool.release(ctx.channel());
+            }
             return;
         }
-        frontEndContext
+        downstreamContext
                 .writeAndFlush(msg)
                 .addListener(
                         (ChannelFutureListener)
@@ -43,6 +45,16 @@ public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
                                                 future.cause());
                                         future.channel().close();
                                     }
+                                    connectionPool
+                                            .release(ctx.channel())
+                                            .addListener(
+                                                    result -> {
+                                                        if (!result.isSuccess()) {
+                                                            log.error(
+                                                                    "Failed to release channel",
+                                                                    result.cause());
+                                                        }
+                                                    });
                                 });
     }
 
@@ -52,7 +64,7 @@ public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
      */
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        this.pendingFrontendContexts.clear();
+        log.info("Channel became inactive..");
         super.channelInactive(ctx);
     }
 
@@ -62,7 +74,6 @@ public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
      */
     @Override
     public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
-        this.pendingFrontendContexts.clear();
         super.channelUnregistered(ctx);
     }
 
