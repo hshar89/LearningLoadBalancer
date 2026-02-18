@@ -1,18 +1,15 @@
 package com.learning.LearningLoadBalancer.server;
 
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.CONNECTION_POOL_KEY;
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.DOWNSTREAM_CONTEXT_KEY;
+
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.util.AttributeKey;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
-
-    public static final AttributeKey<ChannelHandlerContext> DOWNSTREAM_CONTEXT_KEY =
-            AttributeKey.valueOf("downstreamContext");
-    public static final AttributeKey<ConnectionPool> CONNECTION_POOL_KEY =
-            AttributeKey.valueOf("connectionPool");
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
@@ -45,16 +42,6 @@ public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
                                                 future.cause());
                                         future.channel().close();
                                     }
-                                    connectionPool
-                                            .release(ctx.channel())
-                                            .addListener(
-                                                    result -> {
-                                                        if (!result.isSuccess()) {
-                                                            log.error(
-                                                                    "Failed to release channel",
-                                                                    result.cause());
-                                                        }
-                                                    });
                                 });
     }
 
@@ -64,7 +51,7 @@ public class ClientResponseHandler extends ChannelInboundHandlerAdapter {
      */
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        log.info("Channel became inactive..");
+        log.info("Upstream Channel became inactive..");
         super.channelInactive(ctx);
     }
 

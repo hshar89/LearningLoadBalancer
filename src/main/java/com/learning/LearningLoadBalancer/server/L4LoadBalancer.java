@@ -16,7 +16,7 @@ public class L4LoadBalancer {
     public static void main(String[] args) throws InterruptedException {
         EventLoopGroup workerGroup = new NioEventLoopGroup();
         UpstreamClientPool upstreamClientPool =
-                new UpstreamClientPool(new int[] {8081, 8082, 8083}, workerGroup);
+                new UpstreamClientPool(new int[] {8082, 8081, 8083}, workerGroup);
         upstreamClientPool.initConnections();
         EventLoopGroup bossGroup = new NioEventLoopGroup(1);
         try {
@@ -29,7 +29,7 @@ public class L4LoadBalancer {
                                 protected void initChannel(SocketChannel ch) {
                                     ch.pipeline()
                                             .addLast(
-                                                    new LoadBalancerInitializer(
+                                                    new LoadBalancerInboundHandler(
                                                             upstreamClientPool));
                                 }
                             });

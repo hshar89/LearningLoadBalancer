@@ -1,5 +1,11 @@
 package com.learning.LearningLoadBalancer.server;
 
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.CONNECTION_POOL_KEY;
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.DOWNSTREAM_CONTEXT_KEY;
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.PROCESSING_KEY;
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.REQUEST_QUEUE;
+import static com.learning.LearningLoadBalancer.server.ChannelAttributeKeyConstants.UPSTREAM_CHANNEL_KEY;
+
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -15,6 +21,8 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
 import java.net.InetSocketAddress;
+import java.util.LinkedList;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -25,7 +33,7 @@ public class UpstreamClientPool {
 
     private final int[] upstreamServerPorts;
     private final AtomicLong currentIndex = new AtomicLong(0);
-    private final ConcurrentMap<Integer, SimpleConnectionPool> upstreamServerConnectionPool =
+    private final ConcurrentMap<Integer, ConnectionPool> upstreamServerConnectionPool =
             new ConcurrentHashMap<>();
     private final EventLoopGroup workerGroup;
 
@@ -48,9 +56,13 @@ public class UpstreamClientPool {
                     .channel(NioSocketChannel.class)
                     .remoteAddress(new InetSocketAddress("localhost", port))
                     .option(ChannelOption.SO_KEEPALIVE, true);
-            SimpleConnectionPool connectionPool =
-                    new SimpleConnectionPool(
-                            2,
+            ConnectionPool connectionPool =
+                    new EnhancedConnectionPool(
+                            1,
+                            4,
+                            4,
+                            EnhancedConnectionPool.AcquireTimeoutAction.FAIL,
+                            1000,
                             bootstrap,
                             new ChannelPoolHandler() {
                                 @Override
@@ -79,26 +91,49 @@ public class UpstreamClientPool {
 
     public ChannelFuture writeToUpstreamChannel(
             ChannelHandlerContext downstreamChannelCtx, ByteBuf byteBuf) {
+        Queue<RequestTask> newQueue = new LinkedList<>();
+        Queue<RequestTask> existingQueue =
+                downstreamChannelCtx.channel().attr(REQUEST_QUEUE).setIfAbsent(newQueue);
         ChannelPromise promise = downstreamChannelCtx.channel().newPromise();
-        try {
-            Future<Channel> selectedChannel =
-                    acquireChannel(
-                            (int) (currentIndex.getAndIncrement() % upstreamServerPorts.length),
-                            upstreamServerPorts.length,
-                            workerGroup.next().newPromise());
-            if (selectedChannel.isDone()) {
-                if (selectedChannel.isSuccess()) {
-                    log.info("Channel is selected successfully");
-                    writeToUpstreamChannel(
-                            selectedChannel.get(), downstreamChannelCtx, byteBuf, promise);
-                } else {
-                    log.error("Failed to select channel", selectedChannel.cause());
-                    promise.setFailure(selectedChannel.cause());
+        if (existingQueue != null) {
+            synchronized (existingQueue) {
+                Boolean isProcessing = downstreamChannelCtx.channel().attr(PROCESSING_KEY).get();
+                if (isProcessing != null && isProcessing) {
+                    existingQueue.add(new RequestTask(byteBuf, promise));
+                    return promise;
                 }
+            }
+        }
+        processTask(downstreamChannelCtx, new RequestTask(byteBuf, promise));
+        return promise;
+    }
+
+    private ChannelFuture processTask(
+            ChannelHandlerContext downstreamChannelCtx, RequestTask requestTask) {
+        downstreamChannelCtx.channel().attr(PROCESSING_KEY).set(true);
+        ByteBuf byteBuf = requestTask.byteBuf;
+        ChannelPromise promise = requestTask.promise;
+        try {
+            if (downstreamChannelCtx.channel().attr(UPSTREAM_CHANNEL_KEY).get() != null) {
+                Channel upstreamChannel =
+                        downstreamChannelCtx.channel().attr(UPSTREAM_CHANNEL_KEY).get();
+                if (!upstreamChannel.isActive()) {
+                    promise.tryFailure(new RuntimeException("Upstream channel is not active"));
+                    return promise;
+                }
+                writeToUpstreamChannel(upstreamChannel, downstreamChannelCtx, byteBuf, promise);
             } else {
+                Future<Channel> selectedChannel =
+                        acquireChannel(
+                                (int) (currentIndex.getAndIncrement() % upstreamServerPorts.length),
+                                upstreamServerPorts.length,
+                                workerGroup.next().newPromise());
                 selectedChannel.addListener(
                         result -> {
                             if (result.isSuccess()) {
+                                log.info(
+                                        "Listener: Channel is selected successfully {}",
+                                        selectedChannel.getNow().remoteAddress());
                                 writeToUpstreamChannel(
                                         (Channel) result.getNow(),
                                         downstreamChannelCtx,
@@ -114,6 +149,18 @@ public class UpstreamClientPool {
             log.error("Failed to write to backend channel", throwable);
             promise.setFailure(throwable);
         }
+        promise.addListener(
+                result -> {
+                    Queue<RequestTask> requestQueue =
+                            downstreamChannelCtx.channel().attr(REQUEST_QUEUE).get();
+                    synchronized (requestQueue) {
+                        if (result.isSuccess() && requestQueue != null && !requestQueue.isEmpty()) {
+                            RequestTask newTask = requestQueue.poll();
+                            processTask(downstreamChannelCtx, newTask);
+                        }
+                        downstreamChannelCtx.channel().attr(PROCESSING_KEY).set(false);
+                    }
+                });
         return promise;
     }
 
@@ -126,7 +173,7 @@ public class UpstreamClientPool {
         int selectedPort = upstreamServerPorts[currentIndex];
         Promise<Channel> promise = workerGroup.next().newPromise();
         Future<Channel> acquiredChannel =
-                upstreamServerConnectionPool.get(selectedPort).acquireChannelOrCreateOne(promise);
+                upstreamServerConnectionPool.get(selectedPort).acquire(promise);
         if (acquiredChannel.isDone()) {
             if (acquiredChannel.isSuccess()) {
                 outerPromise.trySuccess(acquiredChannel.getNow());
@@ -154,21 +201,20 @@ public class UpstreamClientPool {
     }
 
     private void writeToUpstreamChannel(
-            Channel selectedChannel,
+            Channel upstreamChannel,
             ChannelHandlerContext downstreamChannelCtx,
             ByteBuf byteBuf,
             ChannelPromise channelPromise) {
         // Set the downstream context and connection pool as channel attributes
-        selectedChannel
-                .attr(ClientResponseHandler.DOWNSTREAM_CONTEXT_KEY)
-                .set(downstreamChannelCtx);
-        selectedChannel
-                .attr(ClientResponseHandler.CONNECTION_POOL_KEY)
-                .set(
-                        upstreamServerConnectionPool.get(
-                                ((InetSocketAddress) selectedChannel.remoteAddress()).getPort()));
+        upstreamChannel.attr(DOWNSTREAM_CONTEXT_KEY).set(downstreamChannelCtx);
+        ConnectionPool connectionPool =
+                upstreamServerConnectionPool.get(
+                        ((InetSocketAddress) upstreamChannel.remoteAddress()).getPort());
+        upstreamChannel.attr(CONNECTION_POOL_KEY).set(connectionPool);
+        downstreamChannelCtx.channel().attr(CONNECTION_POOL_KEY).set(connectionPool);
+        downstreamChannelCtx.channel().attr(UPSTREAM_CHANNEL_KEY).set(upstreamChannel);
 
-        selectedChannel
+        upstreamChannel
                 .writeAndFlush(byteBuf.retain())
                 .addListener(
                         (ChannelFutureListener)
@@ -188,6 +234,16 @@ public class UpstreamClientPool {
     public void shutdown() {
         for (ConnectionPool connectionPool : upstreamServerConnectionPool.values()) {
             connectionPool.close();
+        }
+    }
+
+    public static class RequestTask {
+        public final ByteBuf byteBuf;
+        public final ChannelPromise promise;
+
+        public RequestTask(ByteBuf byteBuf, ChannelPromise promise) {
+            this.byteBuf = byteBuf;
+            this.promise = promise;
         }
     }
 }

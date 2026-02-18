@@ -22,11 +22,11 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class SimpleConnectionPool implements ConnectionPool {
 
-    private final Bootstrap bootstrap;
-    private final Deque<Channel> channelDeque = new ConcurrentLinkedDeque<>();
-    private final ChannelPoolHandler channelPoolHandler;
-    private static final AttributeKey<SimpleConnectionPool> POOL_KEY =
-            AttributeKey.valueOf("com.learning.LearningLoadBalancer.server.ConnectionPool");
+    protected final Bootstrap bootstrap;
+    protected final Deque<Channel> channelDeque = new ConcurrentLinkedDeque<>();
+    protected final ChannelPoolHandler channelPoolHandler;
+    protected static final AttributeKey<SimpleConnectionPool> POOL_KEY =
+            AttributeKey.valueOf("com.learning.LearningLoadBalancer.server.SimpleConnectionPool");
 
     public SimpleConnectionPool(
             int minPoolSize, Bootstrap bootstrap, ChannelPoolHandler channelPoolHandler) {
@@ -156,8 +156,8 @@ public class SimpleConnectionPool implements ConnectionPool {
     private void doReleaseChannel(Channel channel, Promise<Void> promise) {
         try {
             assert channel.eventLoop().inEventLoop();
-            if (channel.attr(POOL_KEY).getAndSet(null) != this) {
-                log.error("Channel not owned by this pool");
+            ConnectionPool pool = channel.attr(POOL_KEY).getAndSet(null);
+            if (pool != this) {
                 closeAndFail(
                         channel,
                         new IllegalStateException("Channel not owned by this pool"),
@@ -173,6 +173,7 @@ public class SimpleConnectionPool implements ConnectionPool {
     private void releaseAndOffer(Channel channel, Promise<Void> promise) throws Exception {
         if (!channel.isActive()) {
             closeChannel(channel);
+            promise.tryFailure(new RuntimeException("Channel is not active"));
             return;
         }
         if (offerChannel(channel)) {
