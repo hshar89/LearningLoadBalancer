@@ -1,0 +1,1 @@
+This is an attempt to learn about load balancers. I have tried to implement a L4 load balancer using netty apis. I have used connection pooling same as SimpleConnectionPool and FixedConnectionPool in netty. 
